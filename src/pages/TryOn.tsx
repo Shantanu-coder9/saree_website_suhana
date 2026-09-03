@@ -1,15 +1,15 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Camera, X, Sparkles, Download, ShoppingBag, RefreshCw, Image as ImageIcon, Wand2, Palette, Shuffle } from 'lucide-react';
+import { Upload, Camera, X, Sparkles, Download, ShoppingBag, RefreshCw, Image as ImageIcon, Wand2, Shuffle, AlertCircle, Zap } from 'lucide-react';
 import { products } from '@/data/products';
 import { useCart } from '@/context/CartContext';
 import type { Product } from '@/types';
-import { processTryOn, type SareePalette, type ProcessOptions, DEFAULT_OPTIONS } from '@/utils/tryOnEngine';
 
 type TryOnStage = 'select-saree' | 'upload' | 'processing' | 'result';
 
+const EDGE_FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/virtual-tryon`;
+
 export default function TryOn() {
   const { addToCart } = useCart();
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
@@ -20,10 +20,8 @@ export default function TryOn() {
   const [showCamera, setShowCamera] = useState(false);
   const [tryOnError, setTryOnError] = useState('');
   const [resultImage, setResultImage] = useState<string | null>(null);
-  const [palette, setPalette] = useState<SareePalette | null>(null);
   const [showBefore, setShowBefore] = useState(false);
-
-  const [options, setOptions] = useState<ProcessOptions>(DEFAULT_OPTIONS);
+  const [processingStatus, setProcessingStatus] = useState('');
   const [savedResults, setSavedResults] = useState<{ product: Product; composite: string }[]>([]);
 
   const productImages = products.filter((p) => p.images.length > 0);
@@ -90,45 +88,129 @@ export default function TryOn() {
     }
   };
 
+  /**
+   * Convert an image URL (like Pexels) to a base64 data URI by fetching it.
+   */
+  const fetchImageAsDataURL = async (url: string): Promise<string> => {
+    const response = await fetch(url, { mode: 'cors' });
+    if (!response.ok) throw new Error('Could not load the saree image.');
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  };
+
   const runProcessing = useCallback(async (imageSrc: string) => {
     if (!selectedProduct) return;
     setStage('processing');
     setTryOnError('');
+    setProcessingStatus('Preparing your photo and the saree image...');
+
     try {
-      const { composite, palette: pal } = await processTryOn(
-        imageSrc,
-        selectedProduct.images[0],
-        selectedProduct.fabric,
-        options
-      );
-      setResultImage(composite);
-      setPalette(pal);
-      setStage('result');
+      // Convert the saree product image to base64
+      const garmentBase64 = await fetchImageAsDataURL(selectedProduct.images[0]);
+
+      setProcessingStatus('Sending to the AI virtual try-on model...');
+
+      // Call the edge function
+      const response = await fetch(EDGE_FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+        },
+        body: JSON.stringify({
+          humanImage: imageSrc,
+          garmentImage: garmentBase64,
+          garmentDescription: `A traditional Indian ${selectedProduct.fabric} saree in ${selectedProduct.color} for ${selectedProduct.occasion} wear, draped naturally from the shoulder across the body with the blouse and pallu visible`,
+        }),
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Server error (${response.status})`);
+      }
+
+      const data = await response.json();
+
+      if (data.error) {
+        throw new Error(data.error);
+      }
+
+      if (data.resultUrl) {
+        // Synchronous result (unlikely with FASHN but handle it)
+        setResultImage(data.resultUrl);
+        setStage('result');
+        return;
+      }
+
+      if (data.predictionId) {
+        // Poll the edge function for the result
+        setProcessingStatus('AI is analyzing the saree and your photo...');
+
+        const pollResult = await pollViaEdgeFunction(data.predictionId, setProcessingStatus);
+        if (pollResult) {
+          setResultImage(pollResult);
+          setStage('result');
+        } else {
+          throw new Error('The AI could not complete the try-on. Please try a clearer, full-body photo.');
+        }
+      } else {
+        throw new Error('Unexpected response from the server.');
+      }
     } catch (err) {
-      setTryOnError(err instanceof Error ? err.message : 'Something went wrong during processing. Please try again.');
+      console.error('AI try-on failed:', err);
+      const msg = err instanceof Error ? err.message : 'Processing failed. Please try again.';
+      setTryOnError(msg);
       setStage('upload');
     }
-  }, [selectedProduct, options]);
+  }, [selectedProduct]);
+
+  /**
+   * Poll for prediction result via the edge function (keeps the API key server-side).
+   */
+  const pollViaEdgeFunction = async (
+    predictionId: string,
+    setStatus: (s: string) => void,
+  ): Promise<string | null> => {
+    const maxAttempts = 80;
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      setStatus(`AI is draping the saree on you... (${i + 1}/${maxAttempts})`);
+
+      try {
+        const res = await fetch(`${EDGE_FUNCTION_URL}?prediction=${predictionId}`, {
+          headers: {
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          },
+        });
+        if (!res.ok) continue;
+        const data = await res.json();
+
+        if (data.status === 'completed' && data.resultUrl) {
+          return data.resultUrl;
+        }
+        if (data.status === 'failed') {
+          throw new Error(data.error || 'The AI model could not generate a result.');
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('could not')) {
+          throw err;
+        }
+        // Continue polling on network errors
+      }
+    }
+    return null;
+  };
 
   const reprocess = useCallback(async () => {
     if (userImage && selectedProduct) {
-      setStage('processing');
-      try {
-        const { composite, palette: pal } = await processTryOn(
-          userImage,
-          selectedProduct.images[0],
-          selectedProduct.fabric,
-          options
-        );
-        setResultImage(composite);
-        setPalette(pal);
-        setStage('result');
-      } catch (err) {
-        setTryOnError(err instanceof Error ? err.message : 'Processing failed. Please try again.');
-        setStage('upload');
-      }
+      await runProcessing(userImage);
     }
-  }, [userImage, selectedProduct, options]);
+  }, [userImage, selectedProduct, runProcessing]);
 
   const handleSaveResult = () => {
     if (resultImage && selectedProduct) {
@@ -136,12 +218,28 @@ export default function TryOn() {
     }
   };
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (resultImage) {
-      const link = document.createElement('a');
-      link.download = `suhana-tryon-${selectedProduct?.name || 'saree'}.png`;
-      link.href = resultImage;
-      link.click();
+      try {
+        let downloadUrl = resultImage;
+        if (resultImage.startsWith('http')) {
+          const response = await fetch(resultImage);
+          const blob = await response.blob();
+          downloadUrl = URL.createObjectURL(blob);
+        }
+        const link = document.createElement('a');
+        link.download = `suhana-tryon-${selectedProduct?.name || 'saree'}.png`;
+        link.href = downloadUrl;
+        link.click();
+        if (downloadUrl.startsWith('blob:')) {
+          URL.revokeObjectURL(downloadUrl);
+        }
+      } catch {
+        const link = document.createElement('a');
+        link.download = `suhana-tryon-${selectedProduct?.name || 'saree'}.png`;
+        link.href = resultImage;
+        link.click();
+      }
     }
   };
 
@@ -149,14 +247,8 @@ export default function TryOn() {
     setUserImage(null);
     setSelectedProduct(null);
     setResultImage(null);
-    setPalette(null);
     setTryOnError('');
-    setOptions(DEFAULT_OPTIONS);
     setStage('select-saree');
-  };
-
-  const updateOption = (key: keyof ProcessOptions, value: number | string) => {
-    setOptions((prev) => ({ ...prev, [key]: value }));
   };
 
   return (
@@ -199,9 +291,12 @@ export default function TryOn() {
 
         {/* Error banner */}
         {tryOnError && (
-          <div className="max-w-2xl mx-auto mb-6 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 flex items-center justify-between gap-4">
-            <span>{tryOnError}</span>
-            <button onClick={() => setTryOnError('')} className="font-medium hover:text-rose-950">Dismiss</button>
+          <div className="max-w-2xl mx-auto mb-6 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 flex items-start justify-between gap-4">
+            <span className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              {tryOnError}
+            </span>
+            <button onClick={() => setTryOnError('')} className="font-medium hover:text-rose-900 shrink-0">Dismiss</button>
           </div>
         )}
 
@@ -284,13 +379,13 @@ export default function TryOn() {
                 <div className="p-4 bg-amber-50 rounded-xl">
                   <p className="text-sm text-amber-800 flex items-start gap-2">
                     <ImageIcon className="w-4 h-4 mt-0.5 shrink-0" />
-                    Works with any photo — face shots, portraits, or full-body. Camera captures and uploaded photos both work perfectly.
+                    For best results, use a clear full-body photo where your arms and shoulders are visible. Camera captures and uploaded photos both work.
                   </p>
                 </div>
                 <div className="p-4 bg-rose-50 rounded-xl">
                   <p className="text-sm text-rose-800 flex items-start gap-2">
-                    <Sparkles className="w-4 h-4 mt-0.5 shrink-0" />
-                    Our AI analyzes the saree's colors and patterns, detects your body in the photo, and drapes the fabric on you — just like a virtual fitting room.
+                    <Zap className="w-4 h-4 mt-0.5 shrink-0" />
+                    Our AI uses a fashion virtual try-on model that detects your body and pose, warps the saree onto you, and renders it naturally — preserving your face, hair, and background.
                   </p>
                 </div>
               </div>
@@ -333,9 +428,9 @@ export default function TryOn() {
               </div>
             </div>
             <h2 className="text-2xl font-serif text-stone-900 mb-3">AI is draping your saree...</h2>
-            <p className="text-stone-500">Analyzing colors, detecting your silhouette, and applying the fabric</p>
-            <div className="mt-6 flex justify-center gap-2">
-              {['Extracting colors', 'Detecting body', 'Applying drape', 'Adding texture'].map((step, i) => (
+            <p className="text-stone-500">{processingStatus}</p>
+            <div className="mt-6 flex justify-center gap-2 flex-wrap px-4">
+              {['Analyzing photo', 'Detecting body & pose', 'Warping saree fabric', 'Rendering result'].map((step, i) => (
                 <span key={i} className="text-xs text-stone-400 animate-pulse" style={{ animationDelay: `${i * 0.3}s` }}>
                   {step}{i < 3 && ' · '}
                 </span>
@@ -388,99 +483,12 @@ export default function TryOn() {
                 </button>
                 <button onClick={reprocess} className="flex-1 flex items-center justify-center gap-2 bg-stone-100 text-stone-700 py-3 rounded-full font-medium hover:bg-stone-200 transition-colors">
                   <RefreshCw className="w-4 h-4" />
-                  Reprocess
+                  Regenerate
                 </button>
               </div>
-
-              {/* Color palette display */}
-              {palette && (
-                <div className="bg-white rounded-2xl p-4 mt-4">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Palette className="w-4 h-4 text-rose-700" />
-                    <h3 className="text-sm font-medium text-stone-700">Detected Saree Colors</h3>
-                  </div>
-                  <div className="flex gap-2">
-                    {palette.swatches.slice(0, 6).map((sw, i) => (
-                      <div key={i} className="flex-1 text-center">
-                        <div className="w-full aspect-square rounded-lg border border-stone-200" style={{ backgroundColor: sw.color }} />
-                        <p className="text-xs text-stone-400 mt-1">{Math.round(sw.ratio * 100)}%</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
             </div>
 
             <div>
-              {/* Adjustment controls */}
-              <div className="bg-white rounded-2xl p-6 mb-4">
-                <div className="flex items-center gap-2 mb-5">
-                  <Wand2 className="w-5 h-5 text-rose-700" />
-                  <h2 className="text-lg font-serif font-semibold text-stone-900">Fine-tune Your Look</h2>
-                </div>
-
-                <div className="space-y-4">
-                  <div>
-                    <div className="flex justify-between mb-1.5">
-                      <label className="text-sm font-medium text-stone-700">Color Intensity</label>
-                      <span className="text-sm text-stone-500">{options.intensity}%</span>
-                    </div>
-                    <input type="range" min="20" max="100" value={options.intensity} onChange={(e) => updateOption('intensity', Number(e.target.value))} className="w-full accent-rose-700" />
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between mb-1.5">
-                      <label className="text-sm font-medium text-stone-700">Overlay Size</label>
-                      <span className="text-sm text-stone-500">{options.scale}%</span>
-                    </div>
-                    <input type="range" min="40" max="160" value={options.scale} onChange={(e) => updateOption('scale', Number(e.target.value))} className="w-full accent-rose-700" />
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between mb-1.5">
-                      <label className="text-sm font-medium text-stone-700">Position (Left/Right)</label>
-                      <span className="text-sm text-stone-500">{options.offsetX}px</span>
-                    </div>
-                    <input type="range" min="-200" max="200" value={options.offsetX} onChange={(e) => updateOption('offsetX', Number(e.target.value))} className="w-full accent-rose-700" />
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between mb-1.5">
-                      <label className="text-sm font-medium text-stone-700">Position (Up/Down)</label>
-                      <span className="text-sm text-stone-500">{options.offsetY}px</span>
-                    </div>
-                    <input type="range" min="-200" max="200" value={options.offsetY} onChange={(e) => updateOption('offsetY', Number(e.target.value))} className="w-full accent-rose-700" />
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between mb-1.5">
-                      <label className="text-sm font-medium text-stone-700">Overlay Opacity</label>
-                      <span className="text-sm text-stone-500">{options.opacity}%</span>
-                    </div>
-                    <input type="range" min="20" max="100" value={options.opacity} onChange={(e) => updateOption('opacity', Number(e.target.value))} className="w-full accent-rose-700" />
-                  </div>
-
-                  <div>
-                    <label className="text-sm font-medium text-stone-700 mb-1.5 block">Blend Mode</label>
-                    <select value={options.blendMode} onChange={(e) => updateOption('blendMode', e.target.value)} className="w-full px-4 py-2.5 rounded-lg border border-stone-200 focus:outline-none focus:ring-2 focus:ring-rose-400 text-sm">
-                      <option value="soft-light">Soft Light (Natural)</option>
-                      <option value="overlay">Overlay (Vivid)</option>
-                      <option value="multiply">Multiply (Rich)</option>
-                      <option value="screen">Screen (Light)</option>
-                      <option value="source-over">Normal (Direct)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <button
-                  onClick={reprocess}
-                  className="w-full mt-5 flex items-center justify-center gap-2 bg-rose-900 text-white py-3 rounded-full font-medium hover:bg-rose-800 transition-colors"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                  Apply Changes
-                </button>
-              </div>
-
               {/* Product card */}
               <div className="bg-white rounded-2xl p-6 mb-4">
                 <div className="flex items-start gap-4">
@@ -536,9 +544,6 @@ export default function TryOn() {
             </div>
           </div>
         )}
-
-        {/* Hidden canvas for processing */}
-        <canvas ref={canvasRef} className="hidden" />
       </div>
     </div>
   );
